@@ -29,6 +29,8 @@ import {
   Keyboard,
   Link2,
   ListTree,
+  PackageCheck,
+  PackageOpen,
   Pencil,
   Plus,
   Printer,
@@ -37,6 +39,7 @@ import {
   Search,
   Trash2,
   Undo2,
+  Upload,
   Wifi,
   WifiOff
 } from 'lucide-react';
@@ -53,13 +56,25 @@ import {
   getTargetLabel,
   kindLabel,
   removeAnnotationReferences,
+  resolveConflictMembers,
   updateSentenceText
 } from '@/lib/editor';
+import {
+  applyMerge,
+  buildMergePlan,
+  countPendingAnnotations,
+  createHandoffPackage,
+  normalizeDocument,
+  parseHandoffPackage,
+  serializeHandoffPackage
+} from '@/lib/merge';
 import type {
   Annotation,
   AnnotationKind,
   AnchorType,
   ConflictGroup,
+  MergeOp,
+  MergePlan as MergePlanType,
   Sentence,
   TextDocument,
   ViewMode,
@@ -117,14 +132,16 @@ function buildHtml(document: TextDocument) {
     .join('\n');
 
   const notes = document.annotations
-    .map(
-      (annotation) =>
-        `<li><b>${escapeHtml(annotation.title)}</b> <span>${escapeHtml(annotation.source)}</span><br>${escapeHtml(annotation.body)}</li>`
-    )
+    .map((annotation) => {
+      const pending = annotation.pendingConfirmation ? ' <span class="pending">【锚点待确认】</span>' : '';
+      const origin = annotation.originMember ? ` <small>（${escapeHtml(annotation.originMember)}离线合并）</small>` : '';
+      const note = annotation.mergeNote ? `<br><small class="note">${escapeHtml(annotation.mergeNote)}</small>` : '';
+      return `<li><b>${escapeHtml(annotation.title)}</b>${pending} <span>${escapeHtml(annotation.source)}</span>${origin}<br>${escapeHtml(annotation.body)}${note}</li>`;
+    })
     .join('\n');
 
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${escapeHtml(document.title)}</title>
-<style>body{max-width:780px;margin:48px auto;padding:0 28px;font:17px/1.9 Georgia,"Noto Serif SC",serif;color:#29251f}h1{text-align:center}h2{margin-top:2.4em;border-bottom:1px solid #ddd;padding-bottom:.35em}.summary{color:#6b665d}li{margin:.8em 0}small{color:#777}</style></head>
+<style>body{max-width:780px;margin:48px auto;padding:0 28px;font:17px/1.9 Georgia,"Noto Serif SC",serif;color:#29251f}h1{text-align:center}h2{margin-top:2.4em;border-bottom:1px solid #ddd;padding-bottom:.35em}.summary{color:#6b665d}li{margin:.8em 0}small{color:#777}.pending{color:#b45309}.note{color:#92400e}</style></head>
 <body><h1>${escapeHtml(document.title)}</h1><p style="text-align:center">${escapeHtml(document.author)} · ${escapeHtml(document.edition)}</p>
 ${sections}<hr><h2>注释与校记</h2><ol>${notes}</ol><p><small>导出时间：${new Date().toLocaleString('zh-CN')}</small></p></body></html>`;
 }
@@ -251,9 +268,10 @@ interface AnnotationCardProps {
   onSelect: () => void;
   onUpdate: (patch: Partial<Annotation>) => void;
   onDelete: () => void;
+  onConfirmAnchor?: () => void;
 }
 
-function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, onDelete }: AnnotationCardProps) {
+function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, onDelete, onConfirmAnchor }: AnnotationCardProps) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(annotation.title);
   const [body, setBody] = useState(annotation.body);
@@ -268,24 +286,43 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
   return (
     <Card
       shadow="none"
-      className={`border ${selected ? 'border-amber-500 bg-amber-50/60' : 'border-stone-200 bg-white'}`}
+      className={`border ${
+        annotation.pendingConfirmation
+          ? 'border-amber-500 bg-amber-50/70'
+          : selected
+            ? 'border-amber-500 bg-amber-50/60'
+            : 'border-stone-200 bg-white'
+      }`}
     >
       <CardBody className="gap-3 p-3">
         <button type="button" className="w-full text-left focus-ring" onClick={onSelect}>
           <div className="flex items-start justify-between gap-2">
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <Chip size="sm" color={kindColors[annotation.kind]} variant="flat">
                   {kindLabel(annotation.kind)}
                 </Chip>
                 {annotation.conflictState === 'open' ? <Chip size="sm" color="danger" variant="bordered">争议中</Chip> : null}
+                {annotation.pendingConfirmation ? (
+                  <Chip size="sm" color="warning" variant="solid" startContent={<AlertTriangle className="h-3 w-3" />}>待确认</Chip>
+                ) : null}
+                {annotation.originMember ? <Chip size="sm" variant="flat">{annotation.originMember}的离线批注</Chip> : null}
               </div>
               <h4 className="mt-2 font-semibold text-stone-900">{annotation.title}</h4>
             </div>
             <span className="whitespace-nowrap text-xs text-stone-500">{annotation.source}</span>
           </div>
           {!editing ? <p className="mt-2 text-sm leading-6 text-stone-700">{annotation.body}</p> : null}
+          {!editing && annotation.mergeNote ? (
+            <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-2 text-[11px] leading-5 text-amber-800">{annotation.mergeNote}</p>
+          ) : null}
         </button>
+
+        {annotation.pendingConfirmation && !editing && onConfirmAnchor ? (
+          <Button size="sm" color="warning" variant="flat" fullWidth startContent={<Check className="h-3.5 w-3.5" />} onPress={onConfirmAnchor}>
+            锚点无误，确认挂接
+          </Button>
+        ) : null}
 
         {editing ? (
           <div className="space-y-2">
@@ -340,6 +377,11 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [handoffMember, setHandoffMember] = useState('');
+  const [handoffNote, setHandoffNote] = useState('');
+  const [mergePlan, setMergePlan] = useState<MergePlanType | null>(null);
+  const [handoffMessage, setHandoffMessage] = useState<{ tone: 'ok' | 'warn' | 'err'; text: string } | null>(null);
+  const handoffFileRef = useRef<HTMLInputElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
@@ -349,6 +391,11 @@ export function TextAnnotationWorkbench() {
   const selectedSentence = getSentence(document, workspace.selectedSentenceId);
   const conflicts = useMemo(() => getConflictGroups(document), [document]);
   const searchResults = useMemo(() => collectSearchResults(document, workspace.query), [document, workspace.query]);
+  const pendingCount = useMemo(() => countPendingAnnotations(document), [document]);
+  const pendingAnnotations = useMemo(
+    () => document.annotations.filter((annotation) => annotation.pendingConfirmation),
+    [document]
+  );
 
   const anchor = pendingAnchor ?? {
     id: selectedSentence?.id ?? selectedChapter?.id ?? '',
@@ -364,8 +411,11 @@ export function TextAnnotationWorkbench() {
       if (raw) {
         const stored = JSON.parse(raw) as WorkspaceState;
         if (stored.document?.chapters?.length) {
+          normalizeDocument(stored.document);
           dispatch({ type: 'hydrate', workspace: stored });
           if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
+          const pending = countPendingAnnotations(stored.document);
+          if (pending) setApiMessage(`已恢复离线草稿：${pending} 条合并迁移注释的锚点待确认`);
         }
       }
     } catch {
@@ -519,16 +569,7 @@ export function TextAnnotationWorkbench() {
       type: 'commit',
       label: mergeBodies ? '合并冲突来源' : '按来源解决冲突',
       mutate: (doc) => {
-        const winner = doc.annotations.find((annotation) => annotation.id === winnerId);
-        if (!winner) return;
-        for (const item of doc.annotations) {
-          if (item.anchorId !== group.anchorId || item.kind !== group.kind) continue;
-          item.conflictState = 'resolved';
-          item.conflictResolution = `${new Date().toISOString()} · 选用 ${winner.source}`;
-        }
-        if (mergeBodies) {
-          winner.body = group.annotations.map((item) => `【${item.source}】${item.body}`).join('\n\n');
-        }
+        resolveConflictMembers(doc, group, winnerId, mergeBodies, new Date().toISOString());
       }
     });
   }
@@ -587,9 +628,9 @@ export function TextAnnotationWorkbench() {
       rightVersionId === 'current'
         ? { chapters: document.chapters, annotations: document.annotations, label: '当前草稿' }
         : document.snapshots.find((item) => item.id === rightVersionId);
-    if (!left || !right) return { left: null, right: null, changes: [] as { id: string; label: string; detail: string }[] };
+    if (!left || !right) return { left: null, right: null, changes: [] as { id: string; annotationId?: string; kind: 'sentence' | 'annotation' | 'anchor'; label: string; detail: string }[] };
 
-    const changes: { id: string; label: string; detail: string }[] = [];
+    const changes: { id: string; annotationId?: string; kind: 'sentence' | 'annotation' | 'anchor'; label: string; detail: string }[] = [];
     const leftSentences = new Map(
       left.chapters.flatMap((chapter) => chapter.sentences.map((sentence) => [sentence.id, { chapter, sentence }] as const))
     );
@@ -597,20 +638,45 @@ export function TextAnnotationWorkbench() {
       for (const sentence of chapter.sentences) {
         const previous = leftSentences.get(sentence.id);
         if (!previous) {
-          changes.push({ id: sentence.id, label: `${chapter.title} · 新增句`, detail: sentence.text });
+          changes.push({ id: sentence.id, kind: 'sentence' as const, label: `${chapter.title} · 新增句`, detail: sentence.text });
         } else if (previous.sentence.text !== sentence.text) {
           changes.push({
             id: sentence.id,
+            kind: 'sentence' as const,
             label: `${chapter.title} · 正文有改动`,
             detail: `${previous.sentence.text} → ${sentence.text}`
           });
         }
       }
     }
-    const leftAnnotationIds = new Set(left.annotations.map((item) => item.id));
+    const leftAnnotationById = new Map(left.annotations.map((item) => [item.id, item]));
     for (const annotation of right.annotations) {
-      if (!leftAnnotationIds.has(annotation.id)) {
-        changes.push({ id: annotation.id, label: `新增注释 · ${annotation.title}`, detail: annotation.body });
+      const previous = leftAnnotationById.get(annotation.id);
+      if (!previous) {
+        changes.push({
+          id: annotation.id,
+          kind: 'annotation' as const,
+          label: `新增注释 · ${annotation.title}${annotation.originMember ? `（${annotation.originMember}离线）` : ''}`,
+          detail: annotation.body
+        });
+        continue;
+      }
+      if (previous.body !== annotation.body) {
+        changes.push({
+          id: annotation.id,
+          kind: 'annotation' as const,
+          label: `条文改动 · ${annotation.title}`,
+          detail: `${previous.body} → ${annotation.body}`
+        });
+      }
+      if (previous.anchorId !== annotation.anchorId || previous.anchorType !== annotation.anchorType) {
+        changes.push({
+          id: annotation.anchorId,
+          annotationId: annotation.id,
+          kind: 'anchor' as const,
+          label: `锚点迁移 · ${annotation.title}${annotation.pendingConfirmation ? '（待确认）' : ''}`,
+          detail: `${previous.anchorType}:${previous.anchorId} → ${annotation.anchorType}:${annotation.anchorId}${annotation.mergeNote ? `；${annotation.mergeNote}` : ''}`
+        });
       }
     }
     return { left, right, changes };
@@ -623,6 +689,131 @@ export function TextAnnotationWorkbench() {
   function exportHtml() {
     download(`${document.title}.html`, buildHtml(document), 'text/html;charset=utf-8');
   }
+
+  function exportHandoff() {
+    if (!handoffMember.trim()) {
+      setHandoffMessage({ tone: 'warn', text: '请先填写带出交接包的组员姓名。' });
+      return;
+    }
+    const pkg = createHandoffPackage(document, { member: handoffMember.trim(), note: handoffNote.trim() }, new Date().toISOString());
+    download(
+      `${document.title}.${pkg.member}.handoff.json`,
+      serializeHandoffPackage(pkg),
+      'application/json;charset=utf-8'
+    );
+    setHandoffMessage({
+      tone: 'ok',
+      text: `已生成 ${pkg.member} 的离线交接包（底本：${pkg.baseSnapshotLabel}）。回内网后在“交接”页签导入即可合并，同一包重复导入不会重复新增。`
+    });
+  }
+
+  function readHandoffFile(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const parsed = parseHandoffPackage(String(reader.result ?? ''));
+      if (!parsed.ok) {
+        setMergePlan(null);
+        setHandoffMessage({ tone: 'err', text: parsed.error });
+        return;
+      }
+      if (parsed.pkg.documentId !== document.id) {
+        setMergePlan(null);
+        setHandoffMessage({ tone: 'err', text: `交接包属于另一份文档「${parsed.pkg.documentTitle}」，与当前「${document.title}」不符，已拒绝导入。` });
+        return;
+      }
+      const plan = buildMergePlan(document, parsed.pkg);
+      setMergePlan(plan);
+      if (plan.alreadyImported) {
+        setHandoffMessage({ tone: 'warn', text: plan.importedReason });
+      } else {
+        setHandoffMessage({
+          tone: 'ok',
+          text: `预演完成（尚未写入）：新增 ${plan.counts.add}、采用对方 ${plan.counts.updateIncoming}、双方冲突 ${plan.counts.conflicts}、待确认 ${plan.counts.pending}、跳过 ${plan.counts.skips}，正文版本差异 ${plan.counts.textChanged} 句。`
+        });
+      }
+    };
+    reader.onerror = () => setHandoffMessage({ tone: 'err', text: '读取文件失败，请重试。' });
+    reader.readAsText(file);
+  }
+
+  function confirmMerge() {
+    if (!mergePlan || mergePlan.alreadyImported) return;
+    const pkg = mergePlan.pkg;
+    // 基于当前渲染状态再算一次预演，消息统计与落草稿内容保持一致
+    const freshPlan = buildMergePlan(document, pkg);
+    if (freshPlan.alreadyImported) {
+      setMergePlan(null);
+      setHandoffMessage({ tone: 'warn', text: freshPlan.importedReason });
+      return;
+    }
+    const summary = {
+      added: freshPlan.counts.add,
+      changed: freshPlan.counts.updateIncoming,
+      conflicts: freshPlan.counts.conflicts,
+      pending: freshPlan.counts.pending
+    };
+    dispatch({
+      type: 'commit',
+      label: `导入 ${pkg.member} 的离线交接包`,
+      mutate: (doc) => {
+        // 落草稿时用最新状态重算，避免预演后又有编辑造成偏差；导入登记保证幂等
+        const latestPlan = buildMergePlan(doc, pkg);
+        if (!latestPlan.alreadyImported) applyMerge(doc, latestPlan, new Date().toISOString());
+      }
+    });
+    setMergePlan(null);
+    setHandoffMessage({
+      tone: 'ok',
+      text: `已写入草稿并留下合并快照：新增 ${summary.added}、采用 ${summary.changed}、冲突 ${summary.conflicts}（请在“冲突”页签逐条选定）、待确认 ${summary.pending}。可用撤销撤回本次合并。`
+    });
+    setRightTab('conflicts');
+  }
+
+  function confirmPendingAnnotation(annotationId: string) {
+    dispatch({
+      type: 'commit',
+      label: '确认迁移后的注释锚点',
+      mutate: (doc) => {
+        const annotation = doc.annotations.find((item) => item.id === annotationId);
+        if (!annotation) return;
+        annotation.pendingConfirmation = undefined;
+        annotation.mergeNote = annotation.mergeNote
+          ? `${annotation.mergeNote}（${new Date().toLocaleString('zh-CN')} 人工确认锚点）`
+          : '锚点已经人工确认。';
+      }
+    });
+  }
+
+  function locateAnnotation(annotationId: string) {
+    const target = document.annotations.find((item) => item.id === annotationId);
+    if (!target) return;
+    for (const chapter of document.chapters) {
+      const sentence = chapter.sentences.find((item) => item.id === target.anchorId);
+      if (sentence) {
+        dispatch({ type: 'selectSentence', chapterId: chapter.id, sentenceId: sentence.id });
+        break;
+      }
+      const wordSentence = chapter.sentences.find((item) => item.tokens.some((token) => token.id === target.anchorId));
+      if (wordSentence) {
+        dispatch({ type: 'selectSentence', chapterId: chapter.id, sentenceId: wordSentence.id });
+        break;
+      }
+      if (chapter.id === target.anchorId) {
+        dispatch({ type: 'selectChapter', chapterId: chapter.id });
+        break;
+      }
+    }
+    dispatch({ type: 'selectAnnotation', annotationId: target.id });
+  }
+
+  const mergeOpTone: Record<MergeOp['status'], { label: string; className: string }> = {
+    add: { label: '新增接上', className: 'border-green-200 bg-green-50 text-green-800' },
+    'update-incoming': { label: '采用对方', className: 'border-blue-200 bg-blue-50 text-blue-800' },
+    'conflict-open': { label: '双方冲突·待选定', className: 'border-red-200 bg-red-50 text-red-800' },
+    'identical-skip': { label: '一致跳过', className: 'border-stone-200 bg-stone-50 text-stone-500' },
+    'local-newer-skip': { label: '本地较新·保留', className: 'border-stone-200 bg-stone-50 text-stone-500' },
+    'already-imported-skip': { label: '已导入·跳过', className: 'border-stone-200 bg-stone-50 text-stone-500' }
+  };
 
   const mode = workspace.mode;
   return (
@@ -713,25 +904,38 @@ export function TextAnnotationWorkbench() {
               {workspace.query ? (
                 <ScrollShadow className="max-h-56">
                   <div className="space-y-2 pr-1">
-                    {searchResults.map((result) => (
-                      <button
-                        key={`${result.kind}-${result.annotationId ?? result.sentenceId ?? result.chapterId}`}
-                        type="button"
-                        className="w-full rounded-lg border border-stone-200 bg-white p-2 text-left hover:border-amber-400 hover:bg-amber-50"
-                        onClick={() => {
-                          if (result.annotationId) dispatch({ type: 'selectAnnotation', annotationId: result.annotationId });
-                          if (result.sentenceId) {
-                            dispatch({ type: 'selectSentence', chapterId: result.chapterId, sentenceId: result.sentenceId });
-                          } else {
-                            dispatch({ type: 'selectChapter', chapterId: result.chapterId });
-                          }
-                          setPendingAnchor(null);
-                        }}
-                      >
-                        <div className="text-xs font-semibold text-stone-800">{result.title}</div>
-                        <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-stone-500">{result.excerpt}</div>
-                      </button>
-                    ))}
+                    {searchResults.map((result) => {
+                      const resultAnnotation = result.annotationId
+                        ? document.annotations.find((item) => item.id === result.annotationId)
+                        : undefined;
+                      return (
+                        <button
+                          key={`${result.kind}-${result.annotationId ?? result.sentenceId ?? result.chapterId}`}
+                          type="button"
+                          className={`w-full rounded-lg border p-2 text-left hover:border-amber-400 hover:bg-amber-50 ${
+                            resultAnnotation?.pendingConfirmation ? 'border-amber-300 bg-amber-50' : 'border-stone-200 bg-white'
+                          }`}
+                          onClick={() => {
+                            if (result.annotationId) dispatch({ type: 'selectAnnotation', annotationId: result.annotationId });
+                            if (result.sentenceId) {
+                              dispatch({ type: 'selectSentence', chapterId: result.chapterId, sentenceId: result.sentenceId });
+                            } else {
+                              dispatch({ type: 'selectChapter', chapterId: result.chapterId });
+                            }
+                            setPendingAnchor(null);
+                          }}
+                        >
+                          <div className="flex items-center gap-1.5 text-xs font-semibold text-stone-800">
+                            {resultAnnotation?.pendingConfirmation ? <AlertTriangle className="h-3 w-3 text-amber-600" /> : null}
+                            <span>{result.title}</span>
+                            {resultAnnotation?.originMember ? (
+                              <span className="rounded bg-stone-100 px-1 text-[10px] font-normal text-stone-500">{resultAnnotation.originMember}离线</span>
+                            ) : null}
+                          </div>
+                          <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-stone-500">{result.excerpt}</div>
+                        </button>
+                      );
+                    })}
                     {!searchResults.length ? <p className="p-2 text-xs text-stone-500">没有匹配内容。</p> : null}
                   </div>
                 </ScrollShadow>
@@ -792,6 +996,7 @@ export function TextAnnotationWorkbench() {
               </div>
               <div className="ml-auto flex flex-wrap justify-end gap-2">
                 <Chip variant="flat" color="warning">{conflicts.length} 处待解冲突</Chip>
+                {pendingCount ? <Chip variant="flat" color="warning" startContent={<AlertTriangle className="h-3 w-3" />}>{pendingCount} 条锚点待确认</Chip> : null}
                 <Chip variant="flat">{document.annotations.length} 条注释</Chip>
                 <Button size="sm" variant="flat" startContent={<Printer className="h-4 w-4" />} onPress={() => window.print()}>
                   打印
@@ -865,12 +1070,17 @@ export function TextAnnotationWorkbench() {
                           {mode === 'critical' ? (
                             <div className="mt-3 grid gap-2 rounded-xl border border-blue-100 bg-blue-50/50 p-3 sm:grid-cols-2">
                               {sentenceAnnotations.length ? sentenceAnnotations.map((annotation) => (
-                                <div key={annotation.id} className="critical-variant text-xs leading-5">
-                                  <div className="flex items-center gap-2">
+                                <div key={annotation.id} className={`critical-variant rounded-lg border p-2 text-xs leading-5 ${
+                                  annotation.pendingConfirmation ? 'border-amber-300 bg-amber-50' : 'border-transparent'
+                                }`}>
+                                  <div className="flex flex-wrap items-center gap-2">
                                     <Chip size="sm" color={kindColors[annotation.kind]} variant="flat">{kindLabel(annotation.kind)}</Chip>
                                     <b>{annotation.source}</b>
+                                    {annotation.originMember ? <Chip size="sm" variant="flat">{annotation.originMember}离线</Chip> : null}
+                                    {annotation.pendingConfirmation ? <Chip size="sm" color="warning" variant="solid">待确认</Chip> : null}
                                   </div>
                                   <p className="mt-1 text-stone-700">{annotation.body}</p>
+                                  {annotation.mergeNote ? <p className="mt-1 text-[11px] text-amber-700">{annotation.mergeNote}</p> : null}
                                 </div>
                               )) : <p className="text-xs text-stone-500">本句尚无来源异文或校记。</p>}
                             </div>
@@ -882,13 +1092,20 @@ export function TextAnnotationWorkbench() {
                                 <button
                                   key={annotation.id}
                                   type="button"
-                                  className="rounded-full border border-stone-200 bg-stone-50 px-2.5 py-1 text-[11px] text-stone-600 hover:border-amber-400 hover:text-amber-800"
+                                  className={`rounded-full border px-2.5 py-1 text-[11px] hover:border-amber-400 hover:text-amber-800 ${
+                                    annotation.pendingConfirmation
+                                      ? 'border-amber-400 bg-amber-100/70 text-amber-800'
+                                      : 'border-stone-200 bg-stone-50 text-stone-600'
+                                  }`}
+                                  title={annotation.mergeNote ?? `${annotation.source} · ${kindLabel(annotation.kind)}`}
                                   onClick={(event) => {
                                     event.stopPropagation();
                                     dispatch({ type: 'selectAnnotation', annotationId: annotation.id });
                                   }}
                                 >
+                                  {annotation.pendingConfirmation ? <AlertTriangle className="mr-0.5 inline h-3 w-3" /> : null}
                                   [{index + 1}] {annotation.source} · {kindLabel(annotation.kind)}
+                                  {annotation.originMember ? ` · ${annotation.originMember}` : ''}
                                 </button>
                               ))}
                             </div>
@@ -962,6 +1179,7 @@ export function TextAnnotationWorkbench() {
                           onSelect={() => dispatch({ type: 'selectAnnotation', annotationId: annotation.id })}
                           onUpdate={(patch) => updateAnnotation(annotation.id, patch)}
                           onDelete={() => deleteAnnotation(annotation.id)}
+                          onConfirmAnchor={() => confirmPendingAnnotation(annotation.id)}
                         />
                       )) : <p className="rounded-lg border border-dashed border-stone-300 p-4 text-center text-xs text-stone-500">尚未添加注释。选择词语可缩小注释范围。</p>}
                     </div>
@@ -972,7 +1190,7 @@ export function TextAnnotationWorkbench() {
                   <ScrollShadow className="max-h-[calc(100vh-210px)]">
                     <div className="space-y-4 pr-1">
                       <div className="rounded-xl bg-red-50 p-3 text-xs leading-5 text-red-800">
-                        系统按“相同引用目标 + 相同注释类型”识别来源冲突。可逐条保留、合并或标记解决，正文引用 ID 不变。
+                        系统按“相同引用目标 + 相同注释类型”识别来源冲突；离线合并中双方都改过的注释会同时保留在此，逐条选用或合并条文后再标记解决，正文引用 ID 不变。
                       </div>
                       {conflicts.map((group) => (
                         <Card key={group.key} shadow="none" className="border border-red-100">
@@ -985,15 +1203,28 @@ export function TextAnnotationWorkbench() {
                               <p className="mt-2 line-clamp-2 font-serif text-sm text-stone-800">{group.anchorLabel}</p>
                             </div>
                             {group.annotations.map((annotation) => (
-                              <div key={annotation.id} className="rounded-lg border border-stone-200 bg-stone-50 p-3">
-                                <div className="flex items-center justify-between gap-2">
+                              <div
+                                key={annotation.id}
+                                className={`rounded-lg border p-3 ${
+                                  annotation.pendingConfirmation ? 'border-amber-300 bg-amber-50' : 'border-stone-200 bg-stone-50'
+                                }`}
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2">
                                   <b className="text-sm text-stone-900">{annotation.source}</b>
-                                  <Chip size="sm" variant="flat">{annotation.title}</Chip>
+                                  <span className="flex items-center gap-1">
+                                    {annotation.originMember ? <Chip size="sm" variant="flat">{annotation.originMember}离线</Chip> : null}
+                                    {annotation.pendingConfirmation ? <Chip size="sm" color="warning" variant="solid">待确认</Chip> : null}
+                                    <Chip size="sm" variant="flat">{annotation.title}</Chip>
+                                  </span>
                                 </div>
                                 <p className="mt-2 text-xs leading-5 text-stone-600">{annotation.body}</p>
+                                {annotation.mergeNote ? <p className="mt-1 text-[11px] leading-5 text-amber-700">{annotation.mergeNote}</p> : null}
                                 <div className="mt-2 flex gap-2">
                                   <Button size="sm" color="primary" variant="flat" onPress={() => resolveConflict(group, annotation.id)}>选用此条</Button>
                                   <Button size="sm" variant="light" onPress={() => resolveConflict(group, annotation.id, true)}>合并条文</Button>
+                                  {annotation.pendingConfirmation ? (
+                                    <Button size="sm" color="warning" variant="flat" onPress={() => confirmPendingAnnotation(annotation.id)}>确认锚点</Button>
+                                  ) : null}
                                 </div>
                               </div>
                             ))}
@@ -1007,6 +1238,175 @@ export function TextAnnotationWorkbench() {
                           <p className="mt-1 text-xs text-green-700">已解决记录仍保留在各注释的来源字段中。</p>
                         </div>
                       ) : null}
+                    </div>
+                  </ScrollShadow>
+                </Tab>
+
+                <Tab key="handoff" title={`交接 ${pendingCount ? `·${pendingCount}` : ''}`}>
+                  <ScrollShadow className="max-h-[calc(100vh-210px)]">
+                    <div className="space-y-4 pr-1">
+                      <div className="rounded-xl border border-stone-200 p-3">
+                        <h3 className="flex items-center gap-2 font-semibold text-stone-900"><PackageOpen className="h-4 w-4" />带出离线交接包</h3>
+                        <p className="mt-1 text-[11px] leading-5 text-stone-500">
+                          整包含底本快照与当前草稿，组员离线批注后带回；回内网做三方合并，不会整份覆盖、也不会重复导入。
+                        </p>
+                        <Input className="mt-3" size="sm" label="组员姓名" value={handoffMember} onValueChange={setHandoffMember} placeholder="如：乙校" />
+                        <Input className="mt-2" size="sm" label="离线工作说明（可选）" value={handoffNote} onValueChange={setHandoffNote} placeholder="如：核前两章脚注" />
+                        <Button className="mt-2 w-full" size="sm" color="primary" variant="flat" onPress={exportHandoff} startContent={<FileDown className="h-4 w-4" />}>
+                          导出交接包
+                        </Button>
+                      </div>
+
+                      <div className="rounded-xl border border-stone-200 p-3">
+                        <h3 className="flex items-center gap-2 font-semibold text-stone-900"><Upload className="h-4 w-4" />回内网导入（先预演）</h3>
+                        <input
+                          ref={handoffFileRef}
+                          type="file"
+                          accept=".json,application/json"
+                          className="hidden"
+                          onChange={(event) => {
+                            const file = event.target.files?.[0];
+                            if (file) readHandoffFile(file);
+                            event.target.value = '';
+                          }}
+                        />
+                        <Button
+                          className="mt-3 w-full"
+                          size="sm"
+                          variant="flat"
+                          startContent={<PackageCheck className="h-4 w-4" />}
+                          onPress={() => handoffFileRef.current?.click()}
+                        >
+                          选择交接包并生成预演
+                        </Button>
+
+                        {handoffMessage ? (
+                          <p className={`mt-2 rounded-lg border p-2 text-[11px] leading-5 ${
+                            handoffMessage.tone === 'ok'
+                              ? 'border-green-200 bg-green-50 text-green-800'
+                              : handoffMessage.tone === 'warn'
+                                ? 'border-amber-200 bg-amber-50 text-amber-800'
+                                : 'border-red-200 bg-red-50 text-red-800'
+                          }`}>{handoffMessage.text}</p>
+                        ) : null}
+
+                        {mergePlan ? (
+                          <div className="mt-3 space-y-3">
+                            <div className="rounded-lg bg-stone-50 p-2 text-[11px] leading-5 text-stone-600">
+                              <div><b>{mergePlan.pkg.member}</b> · {mergePlan.pkg.note || '（无说明）'}</div>
+                              <div>导出于 {new Date(mergePlan.pkg.exportedAt).toLocaleString('zh-CN')}</div>
+                              <div>底本：{mergePlan.pkg.baseSnapshotLabel}</div>
+                            </div>
+
+                            {mergePlan.counts.textChanged ? (
+                              <div className="rounded-lg border border-amber-200 bg-amber-50 p-2">
+                                <div className="text-[11px] font-semibold text-amber-800">正文版本差异 {mergePlan.counts.textChanged} 句（合并不改内网正文，请人工比对）</div>
+                                {mergePlan.textDeltas.slice(0, 4).map((delta) => (
+                                  <div key={delta.sentenceId} className="mt-1 text-[11px] leading-5 text-amber-800">
+                                    <b>{delta.label}</b>
+                                    <div>内网：{delta.localText}</div>
+                                    <div>交接：{delta.incomingText}</div>
+                                  </div>
+                                ))}
+                                {mergePlan.textDeltas.length > 4 ? (
+                                  <div className="mt-1 text-[11px] text-amber-700">其余 {mergePlan.textDeltas.length - 4} 句见“版本”页签比较。</div>
+                                ) : null}
+                              </div>
+                            ) : null}
+
+                            <div className="flex flex-wrap gap-1.5 text-[11px]">
+                              <Chip size="sm" color="success" variant="flat">新增 {mergePlan.counts.add}</Chip>
+                              <Chip size="sm" color="primary" variant="flat">采用 {mergePlan.counts.updateIncoming}</Chip>
+                              <Chip size="sm" color="danger" variant="flat">冲突 {mergePlan.counts.conflicts}</Chip>
+                              <Chip size="sm" color="warning" variant="flat">待确认 {mergePlan.counts.pending}</Chip>
+                              <Chip size="sm" variant="flat">跳过 {mergePlan.counts.skips}</Chip>
+                            </div>
+
+                            <ScrollShadow className="max-h-64 rounded-lg border border-stone-200">
+                              <div className="space-y-2 p-2">
+                                {mergePlan.ops.map((op) => (
+                                  <div key={`${op.status}-${op.annotation.id}`} className={`rounded-lg border p-2 text-[11px] leading-5 ${mergeOpTone[op.status].className}`}>
+                                    <div className="flex items-center justify-between gap-2">
+                                      <b>{op.annotation.title}</b>
+                                      <span className="shrink-0 rounded-full bg-white/70 px-2 py-0.5">{mergeOpTone[op.status].label}</span>
+                                    </div>
+                                    <div className="mt-0.5">{op.annotation.source} · {kindLabel(op.annotation.kind)}</div>
+                                    {op.note ? <div className="mt-0.5 opacity-90">{op.note}</div> : null}
+                                    {op.localAnnotation && op.status === 'conflict-open' ? (
+                                      <div className="mt-0.5 border-t border-current/20 pt-0.5">内网现稿：{op.localAnnotation.body}</div>
+                                    ) : null}
+                                  </div>
+                                ))}
+                              </div>
+                            </ScrollShadow>
+
+                            <div className="flex gap-2">
+                              <Button
+                                size="sm"
+                                color="primary"
+                                isDisabled={mergePlan.alreadyImported}
+                                startContent={<Check className="h-4 w-4" />}
+                                onPress={confirmMerge}
+                              >
+                                确认合并并写草稿
+                              </Button>
+                              <Button size="sm" variant="light" onPress={() => { setMergePlan(null); setHandoffMessage(null); }}>
+                                取消预演
+                              </Button>
+                            </div>
+                            <p className="text-[10px] leading-4 text-stone-400">确认后自动留存合并快照，可撤销、可在“版本”中恢复；同一交接包重复导入或断网恢复后再次导入都会被拦截。</p>
+                          </div>
+                        ) : null}
+                      </div>
+
+                      {pendingAnnotations.length ? (
+                        <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-3">
+                          <h3 className="flex items-center gap-2 text-sm font-semibold text-amber-900">
+                            <AlertTriangle className="h-4 w-4" />待确认锚点（{pendingAnnotations.length}）
+                          </h3>
+                          <div className="mt-2 space-y-2">
+                            {pendingAnnotations.map((annotation) => (
+                              <div key={annotation.id} className="rounded-lg border border-amber-200 bg-white p-2 text-[11px] leading-5 text-stone-700">
+                                <div className="flex items-center justify-between gap-2">
+                                  <b>{annotation.title}</b>
+                                  <Button size="sm" variant="light" onPress={() => locateAnnotation(annotation.id)}>定位</Button>
+                                </div>
+                                <p className="mt-1 line-clamp-2">{annotation.mergeNote ?? '锚点待人工确认。'}</p>
+                                <Button
+                                  size="sm"
+                                  color="warning"
+                                  variant="flat"
+                                  className="mt-1"
+                                  onPress={() => confirmPendingAnnotation(annotation.id)}
+                                >
+                                  锚点无误
+                                </Button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      <div className="rounded-xl border border-stone-200 p-3">
+                        <h3 className="text-sm font-semibold text-stone-900">导入历史（{document.importedPackages.length}）</h3>
+                        {document.importedPackages.length ? (
+                          <div className="mt-2 space-y-2">
+                            {[...document.importedPackages].reverse().map((record) => (
+                              <div key={record.packageId} className="rounded-lg bg-stone-50 p-2 text-[11px] leading-5 text-stone-600">
+                                <div className="flex items-center gap-1.5">
+                                  <Check className="h-3 w-3 text-green-600" />
+                                  <b>{record.member}</b>
+                                  <span className="ml-auto">{new Date(record.importedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
+                                </div>
+                                <div className="mt-0.5">{record.note || '（无说明）'}</div>
+                                <div className="mt-0.5 text-stone-500">新增 {record.added} · 采用 {record.changed} · 冲突 {record.conflicts} · 待确认 {record.pending}</div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="mt-2 text-[11px] text-stone-500">尚未导入过交接包。</p>
+                        )}
+                      </div>
                     </div>
                   </ScrollShadow>
                 </Tab>
@@ -1052,10 +1452,20 @@ export function TextAnnotationWorkbench() {
                         <div className="max-h-72 space-y-2 overflow-y-auto p-2">
                           {comparison.changes.map((change) => (
                             <button
-                              key={`${change.id}-${change.label}`}
+                              key={`${change.kind}-${change.id}-${change.label}`}
                               type="button"
-                              className="w-full rounded-lg bg-stone-50 p-2 text-left hover:bg-amber-50"
+                              className={`w-full rounded-lg p-2 text-left hover:bg-amber-50 ${
+                                change.kind === 'anchor' ? 'bg-amber-50' : 'bg-stone-50'
+                              }`}
                               onClick={() => {
+                                if (change.annotationId) {
+                                  locateAnnotation(change.annotationId);
+                                  return;
+                                }
+                                if (change.kind === 'annotation') {
+                                  locateAnnotation(change.id);
+                                  return;
+                                }
                                 for (const chapter of document.chapters) {
                                   const sentence = chapter.sentences.find((item) => item.id === change.id);
                                   if (sentence) {
@@ -1065,7 +1475,10 @@ export function TextAnnotationWorkbench() {
                                 }
                               }}
                             >
-                              <div className="text-xs font-semibold text-stone-800">{change.label}</div>
+                              <div className="text-xs font-semibold text-stone-800">
+                                {change.kind === 'annotation' ? '📝 ' : change.kind === 'anchor' ? '⚠️ ' : '📄 '}
+                                {change.label}
+                              </div>
                               <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-stone-500">{change.detail}</div>
                             </button>
                           ))}

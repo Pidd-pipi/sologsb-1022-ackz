@@ -217,10 +217,24 @@ function findChapterIdForAnnotation(document: TextDocument, annotation: Annotati
 
 export function getConflictGroups(document: TextDocument): ConflictGroup[] {
   const groups = new Map<string, Annotation[]>();
+
+  const join = (annotation: Annotation, key: string) => {
+    const items = groups.get(key);
+    if (items?.some((item) => item.id === annotation.id)) return;
+    groups.set(key, [...(items ?? []), annotation]);
+  };
+
   for (const annotation of document.annotations) {
     if (annotation.conflictState === 'resolved') continue;
-    const key = `${annotation.anchorId}:${annotation.kind}`;
-    groups.set(key, [...(groups.get(key) ?? []), annotation]);
+    const pairKeys = [
+      ...(annotation.mergePairs ?? []),
+      ...(annotation.mergePairId ? [annotation.mergePairId] : [])
+    ].map((pairId) => `pair:${pairId}`);
+    if (pairKeys.length) {
+      for (const key of pairKeys) join(annotation, key);
+    } else {
+      join(annotation, `${annotation.anchorId}:${annotation.kind}`);
+    }
   }
 
   return Array.from(groups.entries())
@@ -251,6 +265,74 @@ function findTokenText(document: TextDocument, tokenId: string) {
     }
   }
   return '';
+}
+
+function pairKeyOf(groupKey: string) {
+  return groupKey.startsWith('pair:') ? groupKey.slice('pair:'.length) : '';
+}
+
+function inPair(annotation: Annotation, pairId: string) {
+  return annotation.mergePairId === pairId || annotation.mergePairs?.includes(pairId);
+}
+
+function pairIdsOf(annotation: Annotation): string[] {
+  return [
+    ...(annotation.mergePairs ?? []),
+    ...(annotation.mergePairId ? [annotation.mergePairId] : [])
+  ];
+}
+
+/** 该注释是否还参与其他未决配对（排除给定配对） */
+function hasOtherOpenPair(document: TextDocument, annotation: Annotation, excludePairId: string): boolean {
+  return pairIdsOf(annotation).some((id) =>
+    id !== excludePairId &&
+    document.annotations.some(
+      (other) => other.id !== annotation.id && inPair(other, id) && other.conflictState !== 'resolved'
+    )
+  );
+}
+
+/**
+ * 解决冲突：合并产生的配对组只在配对范围内收口；
+ * 成员若还参与其他未决配对则保持争议状态，避免跨组误解决。
+ */
+export function resolveConflictMembers(
+  document: TextDocument,
+  group: ConflictGroup,
+  winnerId: string,
+  mergeBodies: boolean,
+  stamp: string
+): void {
+  const winner = document.annotations.find((annotation) => annotation.id === winnerId);
+  if (!winner) return;
+  const pairId = pairKeyOf(group.key);
+
+  if (pairId) {
+    const members = document.annotations.filter((annotation) => inPair(annotation, pairId));
+    for (const member of members) {
+      if (member.id === winnerId) continue;
+      if (hasOtherOpenPair(document, member, pairId)) continue;
+      member.conflictState = 'resolved';
+      member.conflictResolution = `${stamp} · 配对冲突中选用「${winner.source}：${winner.title}」`;
+    }
+    if (!hasOtherOpenPair(document, winner, pairId)) {
+      winner.conflictState = 'resolved';
+      winner.conflictResolution = `${stamp} · 已被选用（来源：${winner.source}）`;
+    }
+    if (mergeBodies) {
+      winner.body = members.map((item) => `【${item.source}】${item.body}`).join('\n\n');
+    }
+    return;
+  }
+
+  for (const item of document.annotations) {
+    if (item.anchorId !== group.anchorId || item.kind !== group.kind) continue;
+    item.conflictState = 'resolved';
+    item.conflictResolution = `${stamp} · 选用 ${winner.source}`;
+  }
+  if (mergeBodies) {
+    winner.body = group.annotations.map((item) => `【${item.source}】${item.body}`).join('\n\n');
+  }
 }
 
 export function kindLabel(kind: AnnotationKind) {
