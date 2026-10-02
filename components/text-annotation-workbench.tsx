@@ -9,13 +9,19 @@ import {
   Divider,
   Input,
   Kbd,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
   ScrollShadow,
   Select,
   SelectItem,
   Tab,
   Tabs,
   Textarea,
-  Tooltip
+  Tooltip,
+  useDisclosure
 } from '@heroui/react';
 import {
   AlertTriangle,
@@ -25,7 +31,9 @@ import {
   CircleHelp,
   FileDown,
   FileJson,
+  FileUp,
   GitCompareArrows,
+  Handshake,
   Keyboard,
   Link2,
   ListTree,
@@ -55,11 +63,18 @@ import {
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
+import {
+  applyMerge,
+  buildHandoverPackage,
+  computeMergePreview,
+  type MergePreview
+} from '@/lib/merge';
 import type {
   Annotation,
   AnnotationKind,
   AnchorType,
   ConflictGroup,
+  HandoverPackage,
   Sentence,
   TextDocument,
   ViewMode,
@@ -279,6 +294,14 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
                   {kindLabel(annotation.kind)}
                 </Chip>
                 {annotation.conflictState === 'open' ? <Chip size="sm" color="danger" variant="bordered">争议中</Chip> : null}
+                {annotation.pendingReview ? (
+                  <Tooltip content={annotation.reviewNote ?? '词级引用已降到所属句，待人工确认'}>
+                    <Chip size="sm" color="warning" variant="flat">待确认</Chip>
+                  </Tooltip>
+                ) : null}
+                {annotation.mergePackageId ? (
+                  <Chip size="sm" variant="flat" color="secondary">离线合并</Chip>
+                ) : null}
               </div>
               <h4 className="mt-2 font-semibold text-stone-900">{annotation.title}</h4>
             </div>
@@ -340,6 +363,9 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [mergePreview, setMergePreview] = useState<MergePreview | null>(null);
+  const mergeFileRef = useRef<HTMLInputElement | null>(null);
+  const mergeDisclosure = useDisclosure();
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
@@ -364,6 +390,7 @@ export function TextAnnotationWorkbench() {
       if (raw) {
         const stored = JSON.parse(raw) as WorkspaceState;
         if (stored.document?.chapters?.length) {
+          if (!Array.isArray(stored.document.importedPackages)) stored.document.importedPackages = [];
           dispatch({ type: 'hydrate', workspace: stored });
           if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
         }
@@ -522,9 +549,12 @@ export function TextAnnotationWorkbench() {
         const winner = doc.annotations.find((annotation) => annotation.id === winnerId);
         if (!winner) return;
         for (const item of doc.annotations) {
-          if (item.anchorId !== group.anchorId || item.kind !== group.kind) continue;
-          item.conflictState = 'resolved';
-          item.conflictResolution = `${new Date().toISOString()} · 选用 ${winner.source}`;
+          const sameAnchorKind = item.anchorId === group.anchorId && item.kind === group.kind;
+          const sameMergeGroup = Boolean(group.mergeGroup) && item.mergeGroup === group.mergeGroup;
+          if (sameAnchorKind || sameMergeGroup) {
+            item.conflictState = 'resolved';
+            item.conflictResolution = `${new Date().toISOString()} · 选用 ${winner.source}`;
+          }
         }
         if (mergeBodies) {
           winner.body = group.annotations.map((item) => `【${item.source}】${item.body}`).join('\n\n');
@@ -622,6 +652,46 @@ export function TextAnnotationWorkbench() {
 
   function exportHtml() {
     download(`${document.title}.html`, buildHtml(document), 'text/html;charset=utf-8');
+  }
+
+  function exportHandover() {
+    const pkg = buildHandoverPackage(document);
+    download(`${document.title}-离线交接包.json`, JSON.stringify(pkg, null, 2), 'application/json;charset=utf-8');
+    setApiMessage('已导出离线交接包，可在其他机器导入合并');
+  }
+
+  async function handleMergeFile(file: File) {
+    try {
+      const text = await file.text();
+      const pkg = JSON.parse(text) as HandoverPackage;
+      if (!pkg || typeof pkg.id !== 'string' || !Array.isArray(pkg.annotations) || !Array.isArray(pkg.chapters)) {
+        setApiMessage('交接包格式不正确：缺少 id、annotations 或 chapters');
+        return;
+      }
+      const preview = computeMergePreview(document, pkg);
+      setMergePreview(preview);
+      mergeDisclosure.onOpen();
+    } catch {
+      setApiMessage('交接包解析失败，请确认是本工具导出的 JSON');
+    }
+  }
+
+  function confirmMerge() {
+    if (!mergePreview || mergePreview.alreadyImported) return;
+    const preview = mergePreview;
+    dispatch({
+      type: 'commit',
+      label: `离线合并：${preview.pkg.label}`,
+      mutate: (doc) => {
+        applyMerge(doc, preview);
+      }
+    });
+    setApiMessage(
+      `离线合并完成：新增 ${preview.added.length}，双方修改 ${preview.modified.length}，跟随到词 ${preview.reanchored.length}，降级待确认 ${preview.downgraded.length}，已留快照`
+    );
+    mergeDisclosure.onClose();
+    setMergePreview(null);
+    if (mergeFileRef.current) mergeFileRef.current.value = '';
   }
 
   const mode = workspace.mode;
@@ -1014,6 +1084,44 @@ export function TextAnnotationWorkbench() {
                 <Tab key="versions" title="版本">
                   <ScrollShadow className="max-h-[calc(100vh-210px)]">
                     <div className="space-y-4 pr-1">
+                      <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-3">
+                        <h3 className="flex items-center gap-2 font-semibold text-stone-900"><Handshake className="h-4 w-4" />离线批注交接</h3>
+                        <p className="mt-1 text-[11px] leading-5 text-stone-600">
+                          各机导出离线交接包，回内网后导入合并：新增注释直接接入，两边改过同一注释保留双方待人工选定，词级引用按正文版本自动跟随到同词或降级待确认。重复导入不会新增。
+                        </p>
+                        <div className="mt-2 grid grid-cols-2 gap-2">
+                          <Button size="sm" color="primary" variant="flat" onPress={exportHandover} startContent={<FileUp className="h-4 w-4" />}>
+                            导出交接包
+                          </Button>
+                          <Button size="sm" color="primary" onPress={() => mergeFileRef.current?.click()} startContent={<FileDown className="h-4 w-4" />}>
+                            导入并合并
+                          </Button>
+                        </div>
+                        <input
+                          ref={mergeFileRef}
+                          type="file"
+                          accept="application/json"
+                          className="hidden"
+                          onChange={(event) => {
+                            const file = event.target.files?.[0];
+                            if (file) void handleMergeFile(file);
+                          }}
+                        />
+                        {document.importedPackages.length ? (
+                          <div className="mt-2 space-y-1">
+                            {document.importedPackages.map((record) => (
+                              <div key={record.id} className="flex items-center gap-2 text-[11px] text-stone-600">
+                                <Check className="h-3 w-3 text-green-600" />
+                                <span className="truncate">{record.label}</span>
+                                <span className="ml-auto whitespace-nowrap text-stone-400">
+                                  {new Date(record.importedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+
                       <div className="rounded-xl border border-stone-200 p-3">
                         <h3 className="flex items-center gap-2 font-semibold text-stone-900"><GitCompareArrows className="h-4 w-4" />保存校订快照</h3>
                         <Input className="mt-3" size="sm" label="版本名称" value={snapshotLabel} onValueChange={setSnapshotLabel} placeholder="如：参校本会校后" />
@@ -1087,6 +1195,115 @@ export function TextAnnotationWorkbench() {
           </Card>
         </aside>
       </main>
+
+      <Modal isOpen={mergeDisclosure.isOpen} onOpenChange={(open) => { if (!open) { mergeDisclosure.onClose(); setMergePreview(null); if (mergeFileRef.current) mergeFileRef.current.value = ''; } }} size="2xl" scrollBehavior="inside">
+        <ModalContent>
+          {() => (
+            <>
+              <ModalHeader className="flex items-center gap-2">
+                <Handshake className="h-5 w-5 text-amber-600" />
+                离线合并预演
+              </ModalHeader>
+              <ModalBody>
+                {mergePreview ? (
+                  <div className="space-y-4">
+                    <div className="rounded-xl border border-stone-200 bg-stone-50 p-3 text-xs leading-6 text-stone-700">
+                      <div><span className="text-stone-500">交接包：</span>{mergePreview.pkg.label}</div>
+                      <div><span className="text-stone-500">编号：</span>{mergePreview.pkg.id}</div>
+                      <div><span className="text-stone-500">导出时间：</span>{new Date(mergePreview.pkg.exportedAt).toLocaleString('zh-CN')}</div>
+                      <div><span className="text-stone-500">来源文档：</span>{mergePreview.pkg.sourceDocumentId}</div>
+                    </div>
+
+                    {mergePreview.alreadyImported ? (
+                      <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-6 text-amber-800">
+                        <div className="flex items-center gap-2 font-semibold"><AlertTriangle className="h-4 w-4" />该交接包已导入过</div>
+                        <p className="mt-1">
+                          已于 {mergePreview.importedAt ? new Date(mergePreview.importedAt).toLocaleString('zh-CN') : '—'} 导入。重复导入不会新增注释，也不会覆盖现有草稿。
+                        </p>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-3">
+                          <div className="rounded-lg border border-green-200 bg-green-50 p-2.5">
+                            <div className="text-base font-semibold text-green-700">{mergePreview.added.length}</div>
+                            <div className="text-green-700/80">新增注释</div>
+                          </div>
+                          <div className="rounded-lg border border-red-200 bg-red-50 p-2.5">
+                            <div className="text-base font-semibold text-red-700">{mergePreview.modified.length}</div>
+                            <div className="text-red-700/80">双方修改·待选定</div>
+                          </div>
+                          <div className="rounded-lg border border-blue-200 bg-blue-50 p-2.5">
+                            <div className="text-base font-semibold text-blue-700">{mergePreview.reanchored.length}</div>
+                            <div className="text-blue-700/80">跟随到同词</div>
+                          </div>
+                          <div className="rounded-lg border border-amber-200 bg-amber-50 p-2.5">
+                            <div className="text-base font-semibold text-amber-700">{mergePreview.downgraded.length}</div>
+                            <div className="text-amber-700/80">降级待确认</div>
+                          </div>
+                          <div className="rounded-lg border border-stone-200 bg-stone-50 p-2.5">
+                            <div className="text-base font-semibold text-stone-600">{mergePreview.unchanged.length}</div>
+                            <div className="text-stone-500">无变化</div>
+                          </div>
+                        </div>
+
+                        {mergePreview.modified.length ? (
+                          <div className="space-y-2">
+                            <div className="text-xs font-semibold text-stone-800">双方修改同一注释（保留双方，导入后在冲突面板由人选定）</div>
+                            {mergePreview.modified.map((entry) => (
+                              <div key={entry.finalId} className="rounded-lg border border-red-100 bg-red-50/50 p-2.5 text-xs">
+                                <div className="font-semibold text-stone-800">{entry.incoming.title}</div>
+                                <div className="mt-1 text-stone-600">
+                                  本方：{entry.local?.source} · {entry.local?.body.slice(0, 40)}
+                                </div>
+                                <div className="text-stone-600">
+                                  来方：{entry.incoming.source} · {entry.incoming.body.slice(0, 40)}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+
+                        {mergePreview.downgraded.length ? (
+                          <div className="space-y-2">
+                            <div className="text-xs font-semibold text-stone-800">词级引用降级到所属句（待人工确认）</div>
+                            {mergePreview.downgraded.map((entry) => (
+                              <div key={entry.finalId} className="rounded-lg border border-amber-100 bg-amber-50/50 p-2.5 text-xs">
+                                <div className="font-semibold text-stone-800">{entry.incoming.title}</div>
+                                <div className="mt-1 text-stone-600">{entry.incoming.reviewNote}</div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+
+                        {mergePreview.added.length ? (
+                          <div className="space-y-1.5">
+                            <div className="text-xs font-semibold text-stone-800">新增注释</div>
+                            {mergePreview.added.map((entry) => (
+                              <div key={entry.finalId} className="rounded-lg border border-stone-200 bg-white p-2 text-xs text-stone-700">
+                                <span className="font-medium">{entry.incoming.title}</span>
+                                <span className="ml-2 text-stone-400">{entry.incoming.source}</span>
+                                {entry.reanchored ? <Chip size="sm" color="primary" variant="flat" className="ml-2">已跟随到同词</Chip> : null}
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                ) : null}
+              </ModalBody>
+              <ModalFooter>
+                <Button size="sm" variant="light" onPress={() => { mergeDisclosure.onClose(); setMergePreview(null); if (mergeFileRef.current) mergeFileRef.current.value = ''; }}>
+                  取消
+                </Button>
+                <Button size="sm" color="primary" isDisabled={!mergePreview || mergePreview.alreadyImported} onPress={confirmMerge} startContent={<Check className="h-4 w-4" />}>
+                  确认合并并写草稿
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
 
       <footer className="mx-auto max-w-[1800px] px-6 pb-8 text-center text-xs text-stone-400">
         数据保存在当前浏览器；清除站点数据会同时删除离线草稿与版本快照。

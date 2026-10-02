@@ -217,30 +217,59 @@ function findChapterIdForAnnotation(document: TextDocument, annotation: Annotati
 
 export function getConflictGroups(document: TextDocument): ConflictGroup[] {
   const groups = new Map<string, Annotation[]>();
+  const mergeGroups = new Map<string, Annotation[]>();
+  const inMergeGroup = new Set<string>();
+
+  // 离线合并产生的双方修改冲突优先成组
+  for (const annotation of document.annotations) {
+    if (annotation.mergeGroup && annotation.conflictState === 'open') {
+      inMergeGroup.add(annotation.id);
+      mergeGroups.set(annotation.mergeGroup, [...(mergeGroups.get(annotation.mergeGroup) ?? []), annotation]);
+    }
+  }
+
   for (const annotation of document.annotations) {
     if (annotation.conflictState === 'resolved') continue;
+    if (inMergeGroup.has(annotation.id)) continue;
     const key = `${annotation.anchorId}:${annotation.kind}`;
     groups.set(key, [...(groups.get(key) ?? []), annotation]);
   }
 
-  return Array.from(groups.entries())
-    .filter(([, items]) => {
-      const bodies = new Set(items.map((item) => item.body.trim()));
-      return bodies.size > 1;
-    })
-    .map(([key, items]) => {
-      const first = items[0];
-      const sentence = first.anchorType === 'sentence' ? getSentence(document, first.anchorId) : undefined;
-      const tokenText = findTokenText(document, first.anchorId);
-      return {
-        key,
-        anchorId: first.anchorId,
-        anchorType: first.anchorType,
-        kind: first.kind,
-        anchorLabel: sentence ? `“${sentence.text}”` : tokenText ? `“${tokenText}”` : '文本片段',
-        annotations: items
-      };
+  const result: ConflictGroup[] = [];
+
+  for (const [mergeGroup, items] of mergeGroups) {
+    if (items.length < 2) continue;
+    const first = items[0];
+    const sentence = first.anchorType === 'sentence' ? getSentence(document, first.anchorId) : undefined;
+    const tokenText = findTokenText(document, first.anchorId);
+    result.push({
+      key: `merge:${mergeGroup}`,
+      anchorId: first.anchorId,
+      anchorType: first.anchorType,
+      kind: first.kind,
+      anchorLabel: sentence ? `“${sentence.text}”` : tokenText ? `“${tokenText}”` : '文本片段',
+      annotations: items,
+      mergeGroup
     });
+  }
+
+  for (const [key, items] of groups.entries()) {
+    const bodies = new Set(items.map((item) => item.body.trim()));
+    if (bodies.size <= 1) continue;
+    const first = items[0];
+    const sentence = first.anchorType === 'sentence' ? getSentence(document, first.anchorId) : undefined;
+    const tokenText = findTokenText(document, first.anchorId);
+    result.push({
+      key,
+      anchorId: first.anchorId,
+      anchorType: first.anchorType,
+      kind: first.kind,
+      anchorLabel: sentence ? `“${sentence.text}”` : tokenText ? `“${tokenText}”` : '文本片段',
+      annotations: items
+    });
+  }
+
+  return result;
 }
 
 function findTokenText(document: TextDocument, tokenId: string) {
